@@ -1,7 +1,15 @@
-% case14_optionA_subplot_baseline_Qlims_legend_clean.m
 % IEEE 14-bus (MATPOWER) — DoS / DoD / FDI with Q-limit enforcement & PV->PQ switching,
-% plus NO-ATTACK baseline. Figures use SUBPLOTS and GLOBAL LEGENDS.
-
+% plus NO-ATTACK baseline.
+%
+% - AC power flow with MATPOWER
+% - DoS: hold last-good load vector Pd during window
+% - DoD: double loads at target buses during window
+% - FDI: corrupt measured Vm (telemetry only) during window
+%
+% IMPORTANT:
+%   - Slack bus is kept in the power flow
+%   - All analysis (RMS deviations, violations, heatmaps, tables, etc.)
+%     is computed on NON-SLACK buses only (as in most cyber-attack papers).
 clear; close all; clc;
 
 %% --- MATPOWER PATH (EDIT IF NEEDED) ---
@@ -13,23 +21,23 @@ config.nSteps      = 144;                 % timesteps (e.g., 10-min steps over a
 config.Vlow        = 0.95;                % voltage lower limit (pu)
 config.Vhigh       = 1.05;                % voltage upper limit (pu)
 
-% Attack windows
-config.DoS_times   = 30:60;               % DoS: hold last-good Pd
-config.DoD_times   = [80:90 120:130];     % DoD: falsify target bus load (under-report)
-config.FDI_times   = 70:75;               % FDI: corrupt measured Vm (telemetry only)
+% Attack windows (in timesteps)
+config.DoS_times   = 20:50;               % DoS: hold last-good Pd
+config.DoD_times   = 100:130;             % DoD: double target-bus loads
+config.FDI_times   = 60:90;               % FDI: corrupt measured Vm (telemetry only)
 
 % DoD parameters
 config.target_buses = [5 7 9];            % candidate targets for DoD
-config.DoD_amp      = 0.20;               % multiply Pd by 0.2 (false low load) at target
+config.DoD_amp      = 1.5;                % multiply Pd by 1.5 (load increase)
 
 % FDI parameters (applied to measured Vm only, post-solve)
-config.FDI_offset   = 0.07;               % +0.07 pu
+config.FDI_offset   = 0.1;               % +0.1 pu
 
 % Diurnal load profile
 config.noise_profile = @(h) (1 + 0.15*sin(2*pi*h/24));  % 15% day-night swing
 
-% Anomaly threshold (RMS from 1 pu, true state)
-config.anom_thresh  = 0.02;               % 2%
+% Anomaly threshold (RMS from 1 pu, true state) on NON-SLACK buses
+config.anom_thresh  = 0.10;               % 10%
 
 %% --- LOAD CASE ---
 mpc0 = loadcase('case14');
@@ -37,7 +45,15 @@ nBus = size(mpc0.bus,1);
 nGen = size(mpc0.gen,1);
 Pd0  = mpc0.bus(:,3);
 
-% Tighten Q limits to accentuate PV->PQ switching (comment to use defaults)
+% Identify slack bus and non-slack buses (for analysis)
+slack_idx = find(mpc0.bus(:,2) == 3);   % ref bus
+if numel(slack_idx) ~= 1
+    error('Expected exactly one slack bus.');
+end
+all_buses = 1:nBus;
+nonSlack  = setdiff(all_buses, slack_idx);   % analysis only on these buses
+
+% Tighten Q limits to accentuate PV->PQ switching (optional)
 q_span = 35;                 % +/- MVAr
 mpc0.gen(:,4) =  q_span;     % Qmax
 mpc0.gen(:,5) = -q_span;     % Qmin
@@ -55,15 +71,15 @@ totalGenP = nan(1,config.nSteps);
 totalLoadP= nan(1,config.nSteps);
 totalLoss = nan(1,config.nSteps);
 
-attack_mask = zeros(1,config.nSteps,'uint8');  % bitmask: 1=DoS, 2=DoD, 4=FDI
-DoD_bus_applied = nan(1,config.nSteps);
+attack_mask      = zeros(1,config.nSteps,'uint8');  % bitmask: 1=DoS, 2=DoD, 4=FDI
+DoD_bus_applied  = nan(1,config.nSteps);            % not used, but kept for completeness
 
 satQmax   = false(nGen, config.nSteps); % Qg == Qmax
 satQmin   = false(nGen, config.nSteps); % Qg == Qmin
 pv_to_pq  = false(numel(pv0_idx), config.nSteps); % PV->PQ events at baseline-PV buses
 
 anomaly   = false(1,config.nSteps);
-viol_low  = false(nBus, config.nSteps);
+viol_low  = false(nBus, config.nSteps);  % will be nonzero only on nonSlack
 viol_high = false(nBus, config.nSteps);
 
 %% --- MATPOWER OPTIONS: enforce Q limits & PV->PQ switching ---
@@ -74,8 +90,8 @@ catch
 end
 
 %% --- ATTACKED SIMULATION ---
-mpc = mpc0;
-lastPd = Pd0;
+mpc   = mpc0;
+lastPd = Pd0;   % for DoS
 
 for t = 1:config.nSteps
     hour    = mod(t-1, 24);
@@ -88,26 +104,25 @@ for t = 1:config.nSteps
         mpc.bus(:,3) = lastPd;
     else
         mpc.bus(:,3) = truePd;
-        lastPd = truePd;
+        lastPd       = truePd;
     end
 
-    % DoD: falsify target bus load (false low load)
+    % DoD: physical load increase (double loads) on target buses
     if ismember(t, config.DoD_times)
         attack_mask(t) = bitor(attack_mask(t), uint8(2));
-        idx = config.target_buses(randi(numel(config.target_buses)));
-        DoD_bus_applied(t) = idx;
-        mpc.bus(idx,3) = max(0, mpc.bus(idx,3) * config.DoD_amp);
+        for b = config.target_buses
+            mpc.bus(b,3) = mpc.bus(b,3) * config.DoD_amp;   % 2x load
+        end
+        DoD_bus_applied(t) = NaN; % placeholder; not used
     end
 
     % Solve TRUE physics with Q-limit enforcement
     try
         results = runpf(mpc, mpopt);
-
         Vm_true(:,t) = results.bus(:,8);
         Va_true(:,t) = results.bus(:,9);
         genP(:,t)    = results.gen(:,2);
         genQ(:,t)    = results.gen(:,3);
-
         totalGenP(t)  = sum(results.gen(:,2),'omitnan');
         totalLoadP(t) = sum(results.bus(:,3),'omitnan');
         totalLoss(t)  = totalGenP(t) - totalLoadP(t);
@@ -134,14 +149,16 @@ for t = 1:config.nSteps
     Vm_meas(:,t) = Vm_true(:,t);
     if ismember(t, config.FDI_times)
         attack_mask(t) = bitor(attack_mask(t), uint8(4));
-        Vm_meas(:,t) = Vm_meas(:,t) + config.FDI_offset;
+        Vm_meas(:,t)   = Vm_meas(:,t) + config.FDI_offset;
     end
 
     % Violations & anomaly on TRUE state
-    if all(isfinite(Vm_true(:,t)))
-        viol_low(:,t)  = Vm_true(:,t) < config.Vlow;
-        viol_high(:,t) = Vm_true(:,t) > config.Vhigh;
-        anomaly(t)     = rms(Vm_true(:,t) - 1) > config.anom_thresh;
+    if all(isfinite(Vm_true(nonSlack,t)))
+        viol_low(:,t)  = false;  % reset slack + nonSlack
+        viol_high(:,t) = false;
+        viol_low(nonSlack,t)  = Vm_true(nonSlack,t) < config.Vlow;
+        viol_high(nonSlack,t) = Vm_true(nonSlack,t) > config.Vhigh;
+        anomaly(t) = rms(Vm_true(nonSlack,t) - 1) > config.anom_thresh;
     else
         viol_low(:,t)=false; viol_high(:,t)=false; anomaly(t)=true;
     end
@@ -155,9 +172,9 @@ genQ_base = nan(nGen, config.nSteps);
 Gen_base  = nan(1,   config.nSteps);
 Load_base = nan(1,   config.nSteps);
 Loss_base = nan(1,   config.nSteps);
-satQmax_base = false(nGen, config.nSteps);
-satQmin_base = false(nGen, config.nSteps);
-pv_to_pq_base = false(numel(pv0_idx), config.nSteps);
+satQmax_base   = false(nGen, config.nSteps);
+satQmin_base   = false(nGen, config.nSteps);
+pv_to_pq_base  = false(numel(pv0_idx), config.nSteps);
 
 mpcB = mpc0;  % independent baseline model
 
@@ -168,7 +185,6 @@ for tt = 1:config.nSteps
 
     try
         rB = runpf(mpcB, mpopt);
-
         Vm_base(:,tt) = rB.bus(:,8);
         Va_base(:,tt) = rB.bus(:,9);
         genP_base(:,tt) = rB.gen(:,2);
@@ -197,31 +213,43 @@ for tt = 1:config.nSteps
 end
 
 % Baseline violations
-viol_low_base  = Vm_base < config.Vlow;
-viol_high_base = Vm_base > config.Vhigh;
-viol_low_base(isnan(Vm_base))  = false;
-viol_high_base(isnan(Vm_base)) = false;
+viol_low_base  = false(nBus, config.nSteps);
+viol_high_base = false(nBus, config.nSteps);
+viol_low_base(nonSlack,:)  = Vm_base(nonSlack,:) < config.Vlow;
+viol_high_base(nonSlack,:) = Vm_base(nonSlack,:) > config.Vhigh;
 
-% Deltas & summaries
+%% Deltas & summaries
 t = 1:config.nSteps;
-Vm_delta     = Vm_true - Vm_base;                       % attacked - baseline
-rms_dev_true = sqrt(mean((Vm_true - 1).^2, 1, 'omitnan'));
-rms_dev_base = sqrt(mean((Vm_base - 1).^2, 1, 'omitnan'));
-meanV_true   = mean(Vm_true, 1, 'omitnan');
-meanV_base   = mean(Vm_base, 1, 'omitnan');
+Vm_delta     = Vm_true(nonSlack,:) - Vm_base(nonSlack,:);  % attacked - baseline
+rms_dev_true = sqrt(mean((Vm_true(nonSlack,:) - 1).^2, 1, 'omitnan'));
+rms_dev_base = sqrt(mean((Vm_base(nonSlack,:) - 1).^2, 1, 'omitnan'));
+meanV_true   = mean(Vm_true(nonSlack,:), 1, 'omitnan');
+meanV_base   = mean(Vm_base(nonSlack,:), 1, 'omitnan');
 
 %% ===================== COMPARATIVE PLOTS (SUBPLOTS) — GLOBAL LEGENDS =====================
 
-% 1) Selected Bus Voltages (True vs Baseline) — global legend of buses
+% --- FDI: measured vs true at bus 5 (example, non-slack) ---
+busFDI = 5;
+figure('Name','FDI_Measured_vs_True_Bus5');
+plot(t, Vm_true(busFDI,:), 'LineWidth',1.5); hold on;
+plot(t, Vm_meas(busFDI,:), '--', 'LineWidth',1.5);
+xlabel('Timestep');
+ylabel('Voltage (p.u.)');
+title(sprintf('FDI Attack: Measured vs True Voltage at Bus %d', busFDI));
+grid on;
+legend({'True V','Measured V (FDI-biased)'}, ...
+       'Location','southoutside','Orientation','horizontal');
+
+% 1) Selected Bus Voltages (True vs Baseline) — exclude slack from analysis
 figure('Name','Selected Bus Voltages (True vs Baseline)');
 tiledlayout(2,1,'TileSpacing','compact','Padding','compact');
-bsel = [1 5 7 9];
+bsel = [5 7 9];   % non-slack "victim" buses
 labels_buses = arrayfun(@(b)sprintf('Bus %d',b), bsel,'UniformOutput',false);
 
 ax1 = nexttile;
-hTrue = plot(t, Vm_true(bsel,:)', 'LineWidth', 1.6);
+plot(t, Vm_true(bsel,:)', 'LineWidth', 1.6);
 yline(config.Vlow,'--k'); yline(config.Vhigh,'--k');
-title('Attacked Case (TRUE)'); xlabel('Timestep'); ylabel('Voltage (p.u.)');
+title('Attacked Case'); xlabel('Timestep'); ylabel('Voltage (p.u.)');
 grid on; shade_windows([1 config.nSteps], config);
 
 ax2 = nexttile;
@@ -230,36 +258,39 @@ yline(config.Vlow,'--k'); yline(config.Vhigh,'--k');
 title('Baseline (No Attack)'); xlabel('Timestep'); ylabel('Voltage (p.u.)');
 grid on;
 
-lg1 = legend(ax2, hBase, labels_buses, 'Orientation','horizontal', 'NumColumns', numel(bsel));
+lg1 = legend(ax2, hBase, labels_buses, ...
+    'Orientation','horizontal', 'NumColumns', numel(bsel));
 lg1.Layout.Tile = 'south';
 
-% 2) Voltage Heatmap (True vs Baseline vs Delta) — global legend for panels
+% 2) Voltage Heatmap (True vs Baseline vs Delta) — NON-SLACK buses only
 figure('Name','Voltage Heatmap Comparison');
 tiledlayout(3,1,'TileSpacing','compact','Padding','compact');
 
 ax1 = nexttile;
-imagesc(t,1:nBus,Vm_true); set(ax1,'YDir','normal');
-title('Attacked: TRUE Voltages'); ylabel('Bus #'); colorbar(ax1); colormap(ax1,'parula');
+imagesc(t, nonSlack, Vm_true(nonSlack,:)); set(ax1,'YDir','normal');
+title('Attacked Voltages'); ylabel('Bus #');
+colorbar(ax1); colormap(ax1,'parula');
 shade_windows([1 config.nSteps], config);
 
 ax2 = nexttile;
-imagesc(t,1:nBus,Vm_base); set(ax2,'YDir','normal');
-title('Baseline: NO-ATTACK Voltages'); ylabel('Bus #'); colorbar(ax2); colormap(ax2,'parula');
+imagesc(t, nonSlack, Vm_base(nonSlack,:)); set(ax2,'YDir','normal');
+title('Baseline: NO-ATTACK Voltages'); ylabel('Bus #');
+colorbar(ax2); colormap(ax2,'parula');
 
 ax3 = nexttile;
-imagesc(t,1:nBus,Vm_delta); set(ax3,'YDir','normal');
+imagesc(t, nonSlack, Vm_delta); set(ax3,'YDir','normal');
 title('\Delta Voltage (Attacked − Baseline)'); xlabel('Timestep'); ylabel('Bus #');
 colorbar(ax3); colormap(ax3,'jet');
 
 % fake handles for a panel legend (optional)
-hold(ax3,'on'); 
+hold(ax3,'on');
 hA = plot(ax3, nan,nan,'-','DisplayName','Attacked (TRUE)');
 hB = plot(ax3, nan,nan,'-','DisplayName','Baseline');
 hD = plot(ax3, nan,nan,'-','DisplayName','\Delta = Attacked − Baseline');
 lg2 = legend([hA hB hD], 'Orientation','horizontal','NumColumns',3);
 lg2.Layout.Tile = 'south';
 
-% 3) RMS Voltage Deviation — global legend
+% 3) RMS Voltage Deviation — NON-SLACK-based
 figure('Name','RMS Voltage Deviation (True vs Baseline)');
 tiledlayout(2,1,'TileSpacing','compact','Padding','compact');
 
@@ -278,7 +309,7 @@ lg3 = legend([p1 p2 p3], {'Attacked RMS','Anomaly flag','Baseline RMS'}, ...
             'Orientation','horizontal','NumColumns',3);
 lg3.Layout.Tile = 'south';
 
-% 4) Mean Voltage & Attack Timeline — global legend
+% 4) Mean Voltage & Attack Timeline — NON-SLACK-based meanV
 figure('Name','Mean Voltage & Attack Timeline');
 tiledlayout(2,1,'TileSpacing','compact','Padding','compact');
 
@@ -291,33 +322,40 @@ title('Attack Timeline'); ylabel('Bitmask (1=DoS,2=DoD,4=FDI)'); grid on;
 ax2 = nexttile;
 pAtt = plot(t,meanV_true,'-k','LineWidth',1.5); hold on;
 pBase= plot(t,meanV_base,'--k','LineWidth',1.2);
-title('Mean Voltage: Attacked vs Baseline'); xlabel('Timestep'); ylabel('Mean V (p.u.)');
+title('Mean Voltage (Non-Slack): Attacked vs Baseline'); xlabel('Timestep'); ylabel('Mean V (p.u.)');
 grid on; shade_windows([1 config.nSteps], config);
 
-lg4 = legend([pMask pAtt pBase], {'Attack bitmask','Mean V (Attacked)','Mean V (Baseline)'}, ...
-            'Orientation','horizontal','NumColumns',3);
+lg4 = legend([pMask pAtt pBase], ...
+    {'Attack bitmask','Mean V (Attacked)','Mean V (Baseline)'}, ...
+    'Orientation','horizontal','NumColumns',3);
 lg4.Layout.Tile = 'south';
 
-% 5) Voltage Violations per Bus — global legend
+% 5) Voltage Violations per Bus — NON-SLACK only
 figure('Name','Voltage Violations Comparison');
 tiledlayout(1,2,'TileSpacing','compact','Padding','compact');
 
 ax1 = nexttile;
-bA = bar(1:nBus, sum((Vm_true<config.Vlow)|(Vm_true>config.Vhigh),2), ...
+viol_attacked_counts = sum( (Vm_true(nonSlack,:)<config.Vlow) | ...
+                            (Vm_true(nonSlack,:)>config.Vhigh), 2);
+bA = bar(nonSlack, viol_attacked_counts, ...
          'FaceColor',[0.8 0.2 0.2]);
-title('Attacked'); xlabel('Bus #'); ylabel('# Violations'); grid on;
+title('Attacked'); xlabel('Bus # (Non-Slack)'); ylabel('# Violations'); grid on;
 
 ax2 = nexttile;
-bB = bar(1:nBus, sum((Vm_base<config.Vlow)|(Vm_base>config.Vhigh),2), ...
+viol_base_counts = sum( (Vm_base(nonSlack,:)<config.Vlow) | ...
+                        (Vm_base(nonSlack,:)>config.Vhigh), 2);
+bB = bar(nonSlack, viol_base_counts, ...
          'FaceColor',[0.2 0.6 0.9]);
-title('Baseline'); xlabel('Bus #'); grid on;
+title('Baseline'); xlabel('Bus # (Non-Slack)'); grid on;
 
-hold(ax2,'on'); dA = plot(ax2,nan,nan,'-','Color',[0.8 0.2 0.2],'LineWidth',6);
+hold(ax2,'on');
+dA = plot(ax2,nan,nan,'-','Color',[0.8 0.2 0.2],'LineWidth',6);
 dB = plot(ax2,nan,nan,'-','Color',[0.2 0.6 0.9],'LineWidth',6);
-lg5 = legend([dA dB], {'Attacked','Baseline'}, 'Orientation','horizontal','NumColumns',2);
+lg5 = legend([dA dB], {'Attacked','Baseline'}, ...
+    'Orientation','horizontal','NumColumns',2);
 lg5.Layout.Tile = 'south';
 
-% 6) Total Power Balance (Gen, Load, Loss) — global legend
+% 6) Total Power Balance (Gen, Load, Loss) — system-wide
 figure('Name','Power Balance Comparison');
 tiledlayout(3,1,'TileSpacing','compact','Padding','compact');
 
@@ -337,7 +375,9 @@ sB = plot(t,Loss_base,'--k','LineWidth',1.2);
 title('System Losses'); xlabel('Timestep'); ylabel('MW'); grid on;
 
 lg6 = legend([gA gB lA lB sA sB], ...
-    {'Gen (Attacked)','Gen (Baseline)','Load (Attacked)','Load (Baseline)','Loss (Attacked)','Loss (Baseline)'}, ...
+    {'Gen (Attacked)','Gen (Baseline)', ...
+     'Load (Attacked)','Load (Baseline)', ...
+     'Loss (Attacked)','Loss (Baseline)'}, ...
     'Orientation','horizontal','NumColumns',3);
 lg6.Layout.Tile = 'south';
 
@@ -362,21 +402,25 @@ figure('Name','PV→PQ Switching Comparison');
 tiledlayout(2,1,'TileSpacing','compact','Padding','compact');
 
 ax1 = nexttile;
-imagesc(t,1:numel(pv0_idx),pv_to_pq); set(ax1,'YDir','normal'); colormap(ax1,flipud(gray)); colorbar(ax1);
+imagesc(t,1:numel(pv0_idx),pv_to_pq); set(ax1,'YDir','normal');
+colormap(ax1,flipud(gray)); colorbar(ax1);
 title('Attacked PV→PQ Switching'); ylabel('PV bus idx');
 
 ax2 = nexttile;
-imagesc(t,1:numel(pv0_idx),pv_to_pq_base); set(ax2,'YDir','normal'); colormap(ax2,flipud(gray)); colorbar(ax2);
+imagesc(t,1:numel(pv0_idx),pv_to_pq_base); set(ax2,'YDir','normal');
+colormap(ax2,flipud(gray)); colorbar(ax2);
 title('Baseline PV→PQ Switching'); xlabel('Timestep'); ylabel('PV bus idx');
 
-hold(ax2,'on'); d1 = plot(ax2,nan,nan,'ks','MarkerFaceColor','k','LineWidth',1);
+hold(ax2,'on');
+d1 = plot(ax2,nan,nan,'ks','MarkerFaceColor','k','LineWidth',1);
 d0 = plot(ax2,nan,nan,'ks','MarkerFaceColor','w','LineWidth',1);
-lg8 = legend([d1 d0], {'Switched (1)','Not switched (0)'}, 'Orientation','horizontal','NumColumns',2);
+lg8 = legend([d1 d0], {'Switched (1)','Not switched (0)'}, ...
+    'Orientation','horizontal','NumColumns',2);
 lg8.Layout.Tile = 'south';
 
-%% Quantitative Table Summary
+%% Quantitative Table Summary (NON-SLACK buses only for voltage metrics)
 
-% Time Frames
+% Time Frames (logical masks)
 t_DoS = bitand(attack_mask,1)~=0;
 t_DoD = bitand(attack_mask,2)~=0;
 t_FDI = bitand(attack_mask,4)~=0;
@@ -391,47 +435,46 @@ m_rms_FDI = mean(rms_dev_true(t_FDI), 'omitnan');
 % Max Voltage Dev
 max_T   = max(rms_dev_true, [], 'all', 'omitnan');
 max_B   = max(rms_dev_base, [], 'all', 'omitnan');
-max_DoS = max(rms_dev_true(:,t_DoS), [], 'all', 'omitnan');
-max_DoD = max(rms_dev_true(:,t_DoD), [], 'all', 'omitnan');
-max_FDI = max(rms_dev_true(:,t_FDI), [], 'all', 'omitnan');
+max_DoS = max(rms_dev_true(t_DoS), [], 'all', 'omitnan');
+max_DoD = max(rms_dev_true(t_DoD), [], 'all', 'omitnan');
+max_FDI = max(rms_dev_true(t_FDI), [], 'all', 'omitnan');
 
-% Voltage Violation Count
+% Voltage Violation Count (NON-SLACK only)
 viol_tot  = viol_low | viol_high;
 viol_base = viol_low_base | viol_high_base;
 
-viol_T   = sum(viol_tot, 'all');
-viol_B   = sum(viol_base, 'all');
-viol_DoS = sum(viol_tot(:,t_DoS), 'all');
-viol_DoD = sum(viol_tot(:,t_DoD), 'all');
-viol_FDI = sum(viol_tot(:,t_FDI), 'all');
+viol_T   = sum(viol_tot(nonSlack,:),  'all');
+viol_B   = sum(viol_base(nonSlack,:), 'all');
+viol_DoS = sum(viol_tot(nonSlack,t_DoS), 'all');
+viol_DoD = sum(viol_tot(nonSlack,t_DoD), 'all');
+viol_FDI = sum(viol_tot(nonSlack,t_FDI), 'all');
 
-% Mean MW Losses
+% Mean MW Losses (system-wide)
 loss_T   = mean(totalLoss, 'omitnan');
 loss_B   = mean(Loss_base, 'omitnan');
 loss_DoS = mean(totalLoss(t_DoS), 'omitnan');
 loss_DoD = mean(totalLoss(t_DoD), 'omitnan');
 loss_FDI = mean(totalLoss(t_FDI), 'omitnan');
 
-% Base v True % Change
-pct_rms  = (abs(m_rms_T  - m_rms_B) / m_rms_B) * 100;
-pct_max  = (abs(max_T  - max_B) / max_B) * 100;
-pct_viol = (abs(viol_T - viol_B) / max(viol_B,1)) * 100;
-pct_loss = (abs(loss_T - loss_B) / loss_B) * 100;
+% Base v True % Change (overall)
+pct_rms  = (abs(m_rms_T  - m_rms_B) / max(m_rms_B,eps)) * 100;
+pct_max  = (abs(max_T    - max_B)   / max(max_B,eps))   * 100;
+pct_viol = (abs(viol_T   - viol_B)  / max(viol_B,1))    * 100;
+pct_loss = (abs(loss_T   - loss_B)  / max(loss_B,eps))  * 100;
 
 % Table Summary
 Metric = { ...
     'RMS Voltage Deviation (avg p.u.)';
     'Max Voltage Deviation (p.u.)';
-    'Voltage Violations (count)';
+    'Voltage Violations (count, non-slack)';
     'Average System Losses (MW)'};
 
-True_V = [m_rms_T; max_T; viol_T; loss_T];
-DoS    = [m_rms_DoS; max_DoS; viol_DoS; loss_DoS];
-DoD    = [m_rms_DoD; max_DoD; viol_DoD; loss_DoD];
-FDI    = [m_rms_FDI; max_FDI; viol_FDI; loss_FDI];
-Pct    = [pct_rms; pct_max; pct_viol; pct_loss];
-
-tbl_sum = table(True_V, DoS, DoD, FDI, Pct, 'RowNames', Metric);
+All_Attacks = [m_rms_T;  max_T;  viol_T;  loss_T];
+DoS         = [m_rms_DoS;max_DoS;viol_DoS;loss_DoS];
+DoD         = [m_rms_DoD;max_DoD;viol_DoD;loss_DoD];
+FDI         = [m_rms_FDI;max_FDI;viol_FDI;loss_FDI];
+Pct_Change  = [pct_rms;  pct_max; pct_viol; pct_loss];
+tbl_sum = table(All_Attacks, DoS, DoD, FDI, Pct_Change, 'RowNames', Metric);
 disp(tbl_sum);
 
 %% --- SAVE FIGURES (PNGs + multi-page PDF) ---
@@ -447,7 +490,7 @@ for i = 1:numel(figs)
     full = fullfile(outdir, filename);
     try
         if exist('exportgraphics','file')
-            exportgraphics(f, full);
+            exportgraphics(f, full, 'Resolution', 300);
         else
             set(f,'PaperPositionMode','auto'); print(f, full, '-dpng', '-r150');
         end
@@ -456,13 +499,22 @@ for i = 1:numel(figs)
         warning('Failed saving %s: %s', full, ME.message);
     end
 end
-fprintf('✅ Saved %d figure(s) to: %s\n', numel(figs), outdir);
+fprintf('Saved %d figure(s) to: %s\n', numel(figs), outdir);
 
 outpdf = fullfile(outdir, 'All_Figures.pdf');
 try
-    exportgraphics(figs(1), outpdf);
-    for k = 2:numel(figs), exportgraphics(figs(k), outpdf, 'Append', true); end
-    fprintf('📄 Combined PDF saved: %s\n', outpdf);
+    if ~isempty(figs)
+        if exist('exportgraphics','file')
+            exportgraphics(figs(1), outpdf, 'Resolution', 300);
+            for k = 2:numel(figs)
+                exportgraphics(figs(k), outpdf, 'Append', true, 'Resolution', 300);
+            end
+        else
+            set(figs(1),'PaperPositionMode','auto');
+            print(figs(1), outpdf, '-dpdf', '-r150');
+        end
+        fprintf('Combined PDF saved: %s\n', outpdf);
+    end
 catch
     warning('Multi-page PDF export failed. PNGs are available in %s.', outdir);
 end
